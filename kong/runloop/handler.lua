@@ -8,6 +8,7 @@
 -- In the `access_by_lua` phase, it is responsible for retrieving the route being proxied by
 -- a consumer. Then it is responsible for loading the plugins to execute on this request.
 local ck          = require "resty.cookie"
+local url         = require "socket.url"
 local meta        = require "kong.meta"
 local utils       = require "kong.tools.utils"
 local Router      = require "kong.router"
@@ -25,12 +26,14 @@ local ipairs      = ipairs
 local tostring    = tostring
 local tonumber    = tonumber
 local sub         = string.sub
+local find        = string.find
 local lower       = string.lower
 local fmt         = string.format
 local sort        = table.sort
 local ngx         = ngx
 local log         = ngx.log
 local ngx_now     = ngx.now
+local rematch     = ngx.re.match
 local update_time = ngx.update_time
 local subsystem   = ngx.config.subsystem
 local unpack      = unpack
@@ -257,39 +260,13 @@ local function balancer_setup_stage1(ctx, scheme, host_type, host, port,
     -- hash_cookie = nil,       -- if Upstream sets hash_on_cookie
   }
 
-  -- TODO: this is probably not optimal
   do
-    local retries = service.retries
-    if retries then
-      balancer_data.retries = retries
+    local s = service or EMPTY_T
 
-    else
-      balancer_data.retries = 5
-    end
-
-    local connect_timeout = service.connect_timeout
-    if connect_timeout then
-      balancer_data.connect_timeout = connect_timeout
-
-    else
-      balancer_data.connect_timeout = 60000
-    end
-
-    local send_timeout = service.write_timeout
-    if send_timeout then
-      balancer_data.send_timeout = send_timeout
-
-    else
-      balancer_data.send_timeout = 60000
-    end
-
-    local read_timeout = service.read_timeout
-    if read_timeout then
-      balancer_data.read_timeout = read_timeout
-
-    else
-      balancer_data.read_timeout = 60000
-    end
+    balancer_data.retries         = s.retries         or 5
+    balancer_data.connect_timeout = s.connect_timeout or 60000
+    balancer_data.send_timeout    = s.write_timeout   or 60000
+    balancer_data.read_timeout    = s.read_timeout    or 60000
   end
 
   ctx.service          = service
@@ -327,7 +304,7 @@ end
 -- in the table below the `before` and `after` is to indicate when they run:
 -- before or after the plugins
 return {
-  build_router     = build_router,
+  build_router = build_router,
 
   -- exported for unit-testing purposes only
   _set_check_router_rebuild = _set_check_router_rebuild,
@@ -660,16 +637,29 @@ return {
 
       ctx.KONG_PREREAD_START = get_now()
 
-      local api = match_t.api or EMPTY_T
-      local route = match_t.route or EMPTY_T
-      local service = match_t.service or EMPTY_T
+      local route = match_t.route
+      local service = match_t.service
       local upstream_url_t = match_t.upstream_url_t
+
+      if not service then
+        -----------------------------------------------------------------------
+        -- Serviceless stream route
+        -----------------------------------------------------------------------
+        local service_scheme = ssl_termination_ctx and "tls" or "tcp"
+        local service_host   = var.server_addr
+
+        match_t.upstream_scheme = service_scheme
+        upstream_url_t.scheme = service_scheme -- for completeness
+        upstream_url_t.type = utils.hostname_type(service_host)
+        upstream_url_t.host = service_host
+        upstream_url_t.port = tonumber(var.server_port, 10)
+      end
 
       balancer_setup_stage1(ctx, match_t.upstream_scheme,
                             upstream_url_t.type,
                             upstream_url_t.host,
                             upstream_url_t.port,
-                            service, route, api)
+                            service, route)
     end,
     after = function(ctx)
       local ok, err, errcode = balancer_setup_stage2(ctx)
@@ -710,9 +700,13 @@ return {
         return kong.response.exit(404, { message = "no Route matched with those values" })
       end
 
-      local route              = match_t.route or EMPTY_T
-      local service            = match_t.service or EMPTY_T
-      local upstream_url_t     = match_t.upstream_url_t
+      local scheme         = var.scheme
+      local host           = var.host
+      local port           = tonumber(var.server_port)
+
+      local route          = match_t.route
+      local service        = match_t.service
+      local upstream_url_t = match_t.upstream_url_t
 
       local realip_remote_addr = var.realip_remote_addr
       local forwarded_proto
@@ -730,23 +724,112 @@ return {
 
       local trusted_ip = kong.ip.is_trusted(realip_remote_addr)
       if trusted_ip then
-        forwarded_proto = var.http_x_forwarded_proto or var.scheme
-        forwarded_host  = var.http_x_forwarded_host  or var.host
-        forwarded_port  = var.http_x_forwarded_port  or var.server_port
+        forwarded_proto = var.http_x_forwarded_proto or scheme
+        forwarded_host  = var.http_x_forwarded_host  or host
+        forwarded_port  = var.http_x_forwarded_port  or port
 
       else
-        forwarded_proto = var.scheme
-        forwarded_host  = var.host
-        forwarded_port  = var.server_port
+        forwarded_proto = scheme
+        forwarded_host  = host
+        forwarded_port  = port
       end
 
-      local protocols = route.protocols
-      if (protocols and
-          protocols.https and not protocols.http and forwarded_proto ~= "https")
+      local protocols = route and route.protocols
+      if (protocols and protocols.https and not protocols.http and
+          forwarded_proto ~= "https")
       then
         ngx.header["connection"] = "Upgrade"
         ngx.header["upgrade"]    = "TLS/1.2, HTTP/1.1"
         return kong.response.exit(426, { message = "Please use HTTPS protocol" })
+      end
+
+      if not service then
+        -----------------------------------------------------------------------
+        -- Serviceless HTTP / HTTPS / HTTP2 route
+        -----------------------------------------------------------------------
+        local service_scheme
+        local service_host
+        local service_port
+
+        -- 1. try to find information from a request-line
+        if var.http2 == "" then
+          local request_line = var.request
+          if request_line then
+            local matches = ngx.re.match(request_line, [[\w+ (\S+)]], "ajos")
+            if matches and matches[1] then
+              local uri = url.parse(matches[1])
+              local uri_scheme = uri and uri.scheme
+              if uri_scheme then
+                uri_scheme = lower(uri_scheme)
+                if uri_scheme ~= "http" or uri_scheme ~= "https" then
+                  service_scheme = uri_scheme
+                  service_host   = uri.host
+                  service_port   = uri.port
+                end
+              end
+            end
+          end
+        end
+
+        -- 2. try to find information from a host header
+        if not service_host then
+          local http_host = var.http_host
+          if http_host then
+            service_scheme = scheme
+
+            local s = find(http_host, ":", 2, true)
+            if s then
+              service_host   = sub(http_host, 1, s - 1)
+              service_port   = sub(http_host, 1, s + 1)
+
+            else
+              service_host   = http_host
+              service_port   = nil
+            end
+          end
+        end
+
+        -- 3. validate port
+        if service_port then
+          if rematch(service_port, [[[1-9]{1}\d{0,4}$]], "adjo") then
+            service_port = tonumber(service_port, 10)
+            if not service_port or service_port < 1 or service_port > 65535 then
+              service_port = nil
+            end
+          end
+
+          if not service_port then
+            service_scheme = nil
+            service_host   = nil
+          end
+        end
+
+        -- 4. use known defaults
+        if service_host then
+          service_host = lower(service_host)
+          if not service_port then
+            if service_scheme == "http" then
+              service_port = 80
+            elseif service_scheme == "https" then
+              service_port = 443
+            else
+              service_port = port
+            end
+          end
+        end
+
+        -- 5. fall-back to server address
+        if not service_host then
+          service_scheme = scheme
+          service_host   = var.server_addr
+          service_port   = port
+        end
+
+        match_t.upstream_scheme = service_scheme
+        upstream_url_t.scheme = service_scheme -- for completeness
+        upstream_url_t.type = utils.hostname_type(service_host)
+        upstream_url_t.host = service_host
+        upstream_url_t.port = service_port
       end
 
       balancer_setup_stage1(ctx, match_t.upstream_scheme,
